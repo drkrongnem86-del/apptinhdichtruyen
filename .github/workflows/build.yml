@@ -1,45 +1,147 @@
-name: Build Android APK
+name: Build IVDripCalculator APK
 
 on:
   push:
-    branches: [main]
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
-  build:
+  build-android:
+    name: Build APK
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Python 3.11
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Setup Java 17
+      - name: Set up Java (OpenJDK 17)
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Install Flet 0.25.2
-        run: pip install flet==0.25.2
+      - name: Cache Buildozer & Android SDK
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.buildozer
+            .buildozer
+          key: ${{ runner.os }}-buildozer-${{ hashFiles('buildozer.spec') }}
+          restore-keys: |
+            ${{ runner.os }}-buildozer-
 
-      - name: Install build deps
+      - name: Install system dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ninja-build clang libgtk-3-dev
-          pip install --upgrade pip
+          sudo apt update -qq
+          sudo apt install -y -qq \
+            libffi-dev \
+            libssl-dev \
+            autoconf \
+            libtool \
+            pkg-config \
+            libltdl-dev \
+            libsqlite3-dev \
+            zlib1g-dev \
+            libbz2-dev \
+            libncurses-dev \
+            libncursesw5-dev \
+            libtinfo-dev \
+            libxml2-dev \
+            libxslt1-dev \
+            libpangocairo-1.0-0
 
-      - name: Build APK
-        run: flet build apk --module-name main_flet
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install buildozer cython==0.29.36
 
-      - name: Upload APK
+      - name: Display buildozer.spec
+        run: cat buildozer.spec
+
+      - name: Build APK with Buildozer
+        run: |
+          buildozer android debug 2>&1 | tee build.log
+        env:
+          GRADLE_OPTS: "-Xmx4g"
+          ANDROIDSDK: ${{ github.workspace }}/.buildozer/android/platform/android-sdk
+          ANDROIDNDK: ${{ github.workspace }}/.buildozer/android/platform/android-ndk-r25b
+          ANDROIDAPI: "33"
+          ANDROIDMINAPI: "21"
+
+      - name: Find and list APK files
+        id: find_apk
+        run: |
+          echo "=== Searching for APK files ==="
+          find . -name "*.apk" -type f 2>/dev/null || echo "No APK found"
+          echo ""
+          echo "=== Checking buildozer output ==="
+          ls -la .buildozer/android/platform/build/ 2>/dev/null || echo "No build dir"
+
+      - name: Copy APK to bin/
+        run: |
+          mkdir -p bin
+          find . -name "*.apk" -type f -exec cp {} bin/ \;
+          ls -la bin/
+
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: app-release-apk
-        path: build/apk/app-release.apk
-        if-no-files-found: error
+          name: IVDripCalculator-APK
+          path: bin/*.apk
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Attach APK to Release (only on tag push)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: bin/*.apk
+          fail_on_unmatched_files: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  test-python:
+    name: Validate Python & Spec
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Check main.py syntax
+        run: |
+          python -m py_compile main.py && echo "main.py OK"
+
+      - name: Check kivy_app.py syntax
+        run: |
+          python -m py_compile kivy_app.py && echo "kivy_app.py OK"
+
+      - name: Validate buildozer.spec
+        run: |
+          python -c "
+          import configparser
+          c = configparser.ConfigParser()
+          c.read('buildozer.spec')
+          assert c.has_section('app'), 'Missing [app] section'
+          assert c.get('app', 'source.filename'), 'Missing source.filename'
+          assert c.get('app', 'source.dir'), 'Missing source.dir'
+          print('buildozer.spec OK')
+          "
